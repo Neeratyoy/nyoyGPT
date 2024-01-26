@@ -10,11 +10,6 @@ from typing import Callable, Tuple
 from model import GPTConfig, GPT
 
 
-SEED = 1337
-DATASET = "shakespeare_char"
-DATA_PATH = Path(__file__).resolve().parent / "data"
-
-
 def ddp_setup(hps: dict):
     # DDP settings
     backend = 'nccl'  # 'nccl', 'gloo', etc.
@@ -176,7 +171,9 @@ def get_custom_dataloader(
     dataset: str,
     block_size: int,
     batch_size: int,
-    data_dir: str | Path = DATA_PATH,
+    device: str,
+    device_type: str,
+    data_dir: str | Path,
 ) -> Tuple[Callable, str]:
     data_dir = os.path.join(data_dir, dataset)
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
@@ -218,8 +215,13 @@ def get_custom_dataloader(
 
 def get_full_hp_list():
     hps = dict(
-        gradient_accumulation_steps = 5 * 8, # used to simulate larger batch sizes
-        batch_size = 12, # if gradient_accumulation_steps > 1, this is the micro-batch size
+        seed = 1337,
+        # dataset related entries
+        dataset = "shakespeare_char",
+        data_path = "./data",  # Path(__file__).resolve().parent / "data",
+        # model training knobs
+        gradient_accumulation_steps = 5 * 8,  # used to simulate larger batch sizes
+        batch_size = 12,  # if gradient_accumulation_steps > 1, this is the micro-batch size
         block_size = 1024,
         # model
         n_layer = 12,
@@ -239,13 +241,19 @@ def get_full_hp_list():
         warmup_iters = 2000, # how many steps to warm up for
         lr_decay_iters = 600000, # should be ~= max_iters per Chinchilla
         min_lr = 6e-5, # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+        # training stuff
+        out_dir = "out",
+        eval_interval = 100,
+        log_interval = 10,
+        eval_iters = 200,
+        eval_only = False,  # if True, script exits right after the first eval
+        always_save_checkpoint = True,  # if True, always save a checkpoint after each eval
+        init_from = "scratch",  # 'scratch' or 'resume' or 'gpt2*'
     )
-    def custom_hp_list(**kwargs):
+    def get_custom_hp_list(**kwargs):
         nonlocal hps
         _hp_diff = set(kwargs.keys()) - set(hps.keys())
         assert len(_hp_diff) == 0, f"Hyperparameters not recognized: {_hp_diff}"
-        for k, v in kwargs.items():
-            if k in hps:
-                hps.update({k, v})
+        hps.update(kwargs)
         return hps
-    return custom_hp_list
+    return get_custom_hp_list

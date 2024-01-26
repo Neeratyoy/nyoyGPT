@@ -22,7 +22,7 @@ import math
 from pathlib import Path
 import pickle
 from contextlib import nullcontext
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import numpy as np
 import torch
@@ -36,39 +36,18 @@ from utils import (
 )
 
 
-############################################
-# GLOBAL VARIABLES UNCHANGED FROM KARPATHY #
-############################################
-SEED = 1337
-DATASET = "shakespeare_char"
-DATA_PATH = Path(__file__).resolve().parent / "data"
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = "out"
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = "scratch" # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-# wandb_log = False # disabled by default
-# wandb_project = 'owt'
-# wandb_run_name = 'gpt2' # 'run' + str(time.time())
-
 ####################
 # HELPER FUNCTIONS #
 ####################
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(model):
+def estimate_loss(model: Any, hps: dict, get_batch: Callable, ctx: Any):
     out = {}
     model.eval()
-    for split in ["train", "val"]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+    for split in ['train', 'val']:
+        losses = torch.zeros(hps["eval_iters"])
+        for k in range(hps["eval_iters"]):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
@@ -79,7 +58,7 @@ def estimate_loss(model):
 
 
 # learning rate decay scheduler (cosine with warmup)
-def get_lr(it: int, hps: dict):
+def get_lr(it, hps):
     # 1) linear warmup for warmup_iters steps
     if it < hps["warmup_iters"]:
         return hps["learning_rate"] * it / hps["warmup_iters"]
@@ -93,10 +72,14 @@ def get_lr(it: int, hps: dict):
     return hps["min_lr"] + coeff * (hps["learning_rate"] - hps["min_lr"])
 
 
-if __name__ == "__main__":
-
+def main_run(**kwargs):
     get_hps = get_full_hp_list()
-    hps = get_hps()
+    # overwriting for a smaller scale test setup
+    hps = get_hps(**kwargs)
+
+    breakpoint()
+
+    # setup PyTorch DDP
     (
         ddp,
         device,
@@ -110,28 +93,38 @@ if __name__ == "__main__":
         tokens_per_iter
     ) = ddp_setup(hps)
 
+    # uncomment for Mac
+    device = "cpu"
+    compile = False
+
     if master_process:
-        os.makedirs(out_dir, exist_ok=True)
-    torch.manual_seed(SEED + seed_offset)
+        os.makedirs(hps["out_dir"], exist_ok=True)
+    torch.manual_seed(hps["seed"] + seed_offset)
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
     device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
     # note: float16 data type will automatically use a GradScaler
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    ctx = (
+        nullcontext() 
+        if device_type == 'cpu' 
+        else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    )
 
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     iter_num = 0
     best_val_loss = 1e9
 
     get_batch, meta_vocab_size = get_custom_dataloader(
-        DATASET,
+        hps["dataset"],
         hps["block_size"],
         hps["batch_size"],
-        DATA_PATH
+        device,
+        device_type,
+        hps["data_path"],
     )
 
-    out_dir = Path(__file__).resolve().parent / "out"
+    out_dir = hps["out_dir"]  # Path(__file__).resolve().parent / "out"
     model_args, model, optimizer, scaler = prepare_model_optimizer(
         hps=hps,
         ddp=ddp,
@@ -140,7 +133,7 @@ if __name__ == "__main__":
         ddp_local_rank=ddp_local_rank,
         compile=compile,
         dtype=dtype,
-        init_from=init_from, 
+        init_from=hps["init_from"], 
         meta_vocab_size=meta_vocab_size,
         out_dir=out_dir,
     )
@@ -159,14 +152,14 @@ if __name__ == "__main__":
             param_group['lr'] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
-            losses = estimate_loss(model)
+        if iter_num % hps["eval_interval"] == 0 and master_process:
+            losses = estimate_loss(model, hps, get_batch, ctx)
             print(
                 f"step {iter_num}: train loss {losses['train']:.4f}, "
                 f"val loss {losses['val']:.4f}"
             )
 
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+            if losses['val'] < best_val_loss or hps["always_save_checkpoint"]:
                 best_val_loss = losses['val']
                 if iter_num > 0:
                     checkpoint = {
@@ -179,7 +172,7 @@ if __name__ == "__main__":
                     }
                     print(f"saving checkpoint to {out_dir}")
                     torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-        if iter_num == 0 and eval_only:
+        if iter_num == 0 and hps["eval_only"]:
             break
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -214,7 +207,7 @@ if __name__ == "__main__":
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0 and master_process:
+        if iter_num % hps["log_interval"] == 0 and master_process:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * hps["gradient_accumulation_steps"]
@@ -236,3 +229,18 @@ if __name__ == "__main__":
 
     if ddp:
         destroy_process_group()
+
+
+if __name__ == "__main__":
+    main_run(
+        block_size=256,
+        n_layer=6,
+        n_head=8,
+        n_embd=256,
+        max_iters=5000,
+        warmup_iters=int(5000 * 0.05),  # 5 % of total training steps
+        lr_decay_iters=5000,
+        eval_interval=100,
+        log_interval=10,
+        eval_iters=200,
+    )
