@@ -78,8 +78,11 @@ def prepare_model_optimizer(
     dtype: str = "bfloat16",
     init_from: str = "scratch",
     meta_vocab_size: int | None = None,
-    out_dir: str | Path = Path(__file__).resolve().parent / "out",
+    load_dir: str | Path | None = None,
+    out_dir: str | Path = "./out",
 ):
+    iter_num = 0
+    best_val_loss = 1e-9
     # model init
     model_args = dict(
         n_layer=hps["n_layer"],
@@ -100,9 +103,13 @@ def prepare_model_optimizer(
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
     elif init_from == 'resume':
-        print(f"Resuming training from {out_dir}")
         # resume training from a checkpoint.
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+        ckpt_path = (
+            os.path.join(out_dir, 'ckpt.pt')
+            if load_dir is None
+            else os.path.join(load_dir, 'ckpt.pt')
+        )
+        print(f"Resuming training from {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
         # force these config attributes to be equal otherwise we can't even resume training
@@ -160,7 +167,7 @@ def prepare_model_optimizer(
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
-    return model_args, model, optimizer, scaler
+    return model_args, model, optimizer, scaler, iter_num, best_val_loss
 
 
 ##########################################
@@ -232,6 +239,7 @@ def get_full_hp_list():
         # adamw optimizer
         learning_rate = 6e-4, # max learning rate
         max_iters = 600000, # total number of training iterations
+        step_budget = 600000,
         weight_decay = 1e-1,
         beta1 = 0.9,
         beta2 = 0.95,
@@ -242,6 +250,7 @@ def get_full_hp_list():
         lr_decay_iters = 600000, # should be ~= max_iters per Chinchilla
         min_lr = 6e-5, # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
         # training stuff
+        load_dir = None,
         out_dir = "out",
         eval_interval = 100,
         log_interval = 10,

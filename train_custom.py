@@ -72,12 +72,10 @@ def get_lr(it, hps):
     return hps["min_lr"] + coeff * (hps["learning_rate"] - hps["min_lr"])
 
 
-def main_run(**kwargs):
+def main_run(**kwargs) -> dict:
     get_hps = get_full_hp_list()
     # overwriting for a smaller scale test setup
     hps = get_hps(**kwargs)
-
-    breakpoint()
 
     # setup PyTorch DDP
     (
@@ -94,8 +92,8 @@ def main_run(**kwargs):
     ) = ddp_setup(hps)
 
     # uncomment for Mac
-    device = "cpu"
-    compile = False
+    # device = "cpu"
+    # compile = False
 
     if master_process:
         os.makedirs(hps["out_dir"], exist_ok=True)
@@ -111,10 +109,6 @@ def main_run(**kwargs):
         else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     )
 
-    # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-    iter_num = 0
-    best_val_loss = 1e9
-
     get_batch, meta_vocab_size = get_custom_dataloader(
         hps["dataset"],
         hps["block_size"],
@@ -124,8 +118,9 @@ def main_run(**kwargs):
         hps["data_path"],
     )
 
-    out_dir = hps["out_dir"]  # Path(__file__).resolve().parent / "out"
-    model_args, model, optimizer, scaler = prepare_model_optimizer(
+    out_dir = hps["out_dir"]
+    load_dir = hps["load_dir"]
+    model_args, model, optimizer, scaler, iter_num, best_val_loss = prepare_model_optimizer(
         hps=hps,
         ddp=ddp,
         device=device,
@@ -133,8 +128,9 @@ def main_run(**kwargs):
         ddp_local_rank=ddp_local_rank,
         compile=compile,
         dtype=dtype,
-        init_from=hps["init_from"], 
+        init_from=hps["init_from"],
         meta_vocab_size=meta_vocab_size,
+        load_dir=load_dir,
         out_dir=out_dir,
     )
 
@@ -144,6 +140,9 @@ def main_run(**kwargs):
     local_iter_num = 0 # number of iterations in the lifetime of this process
     raw_model = model.module if ddp else model # unwrap DDP container if needed
     running_mfu = -1.0
+    curr_loop_steps = 0
+
+    start = time.time()
     while True:
 
         # determine and set the learning rate for this iteration
@@ -167,6 +166,8 @@ def main_run(**kwargs):
                         'optimizer': optimizer.state_dict(),
                         'model_args': model_args,
                         'iter_num': iter_num,
+                        'train_loss': losses['train'].item(),
+                        'val_loss': losses['val'].item(),
                         'best_val_loss': best_val_loss,
                         'config': config,
                     }
@@ -217,30 +218,69 @@ def main_run(**kwargs):
                 )
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(
-                f"iter {iter_num}: loss {lossf:.4f}, "
+                f"iter {iter_num}, curr_loop_steps {curr_loop_steps}: loss {lossf:.4f}, "
                 f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
             )
         iter_num += 1
         local_iter_num += 1
+        curr_loop_steps += 1
 
         # termination conditions
-        if iter_num > hps["max_iters"]:
+        if (
+            (hps["step_budget"] is not None and curr_loop_steps == hps["step_budget"])
+            or iter_num >= hps["max_iters"]
+        ):
+            _losses = estimate_loss(model, hps, get_batch, ctx)
+            print(
+                f"step {iter_num}: train loss {_losses['train']:.4f}, "
+                f"val loss {_losses['val']:.4f}"
+            )
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'train_loss': _losses['train'].item(),
+                'val_loss': _losses['val'].item(),
+                'best_val_loss': best_val_loss,
+                'config': config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
             break
+
+    end = time.time()
+    return_dict = dict(
+        val_loss=checkpoint["train_loss"],
+        train_loss=checkpoint["val_loss"],
+        iter_num=checkpoint["iter_num"],
+        time_taken=end - start,
+    )
 
     if ddp:
         destroy_process_group()
 
+    return return_dict
+
 
 if __name__ == "__main__":
-    main_run(
+    _output = main_run(
+        # dataset="openwebtext",
+        dataset="shakespeare_char",
         block_size=256,
-        n_layer=6,
-        n_head=8,
-        n_embd=256,
-        max_iters=5000,
-        warmup_iters=int(5000 * 0.05),  # 5 % of total training steps
-        lr_decay_iters=5000,
-        eval_interval=100,
-        log_interval=10,
-        eval_iters=200,
+        n_layer=1,
+        n_head=1,
+        n_embd=64,
+        max_iters=100,
+        warmup_iters=int(100 * 0.05),  # 5 % of total training steps
+        lr_decay_iters=100,
+        # step_budget=42,
+        eval_interval=10,
+        log_interval=1,
+        eval_iters=10,
+        # init_from="scratch",
+        init_from="resume",
+        load_dir="./debug/0",
+        out_dir="./debug/1",
     )
+    print(_output)
